@@ -1,0 +1,116 @@
+ let FilteredEvents =
+    AppEvents
+    |where Properties.AppGeneration =="V2" and Properties.AppEnvironment!="Prod"
+    | where Properties .AgentWorkspaceKey in (toupper("{WorkspaceKey}"));
+
+let users =
+    FilteredEvents
+    | extend TeamId = tostring(Properties.AgentTeamId)
+    | distinct UserId, TeamId, UserAuthenticatedId, ClientModel;
+
+ 
+let FirstSeen=
+FilteredEvents
+|where Name in ("AgentLoginEvent","ApplicationStartEvent","ScreenUnlockEvent")
+|extend day=bin(TimeGenerated, 1d)
+|summarize FirstSeen=min(TimeGenerated) by UserId,ClientModel,day;
+ 
+let usersEvents =
+FilteredEvents
+|extend day=bin(TimeGenerated, 1d)
+| extend TeamId = tostring(Properties.AgentTeamId)
+|summarize LastSeen=max(TimeGenerated)by UserId,TeamId,UserAuthenticatedId,ClientModel,day
+|join kind=fullouter FirstSeen on day,UserId,ClientModel
+|project-away day1
+| extend timediff=datetime_diff('second', LastSeen,FirstSeen)
+|project UserId,TeamId,UserAuthenticatedId,ClientModel,FirstSeen,LastSeen,SessionDuration=timediff,day
+;
+
+ let NoLastExitEvent= 
+ FilteredEvents
+ | where Name in ("ScreenLockEvent","ApplicationExitEvent","AgentLogoutEvent","AgentLoginEvent") 
+ |extend day = startofday(TimeGenerated)
+ |extend TeamId = tostring(Properties.AgentTeamId)
+ | summarize LastEventTime = arg_max(TimeGenerated, *) by UserId,ClientModel,TeamId, day
+ |where Name=="AgentLoginEvent"
+ |join kind=fullouter usersEvents on UserId,TeamId,ClientModel,day
+ |where isnotempty(UserId)
+ | extend NoAppExitDur =datetime_diff('second', LastSeen,LastEventTime)
+ |project NoAppExitDur,UserId,ClientModel,TeamId,day;
+ 
+let lockEvents=
+ FilteredEvents
+ |where Name in ("ScreenLockEvent" ,"ScreenUnlockEvent","ApplicationExitEvent","AgentLogoutEvent","AgentLoginEvent")
+| project TimeGenerated, Name,ClientModel, UserId, SessionId,TeamId = tostring(Properties.AgentTeamId)
+| order by UserId,ClientModel,TeamId,TimeGenerated asc
+| serialize
+| extend PreviousEvent = iff(UserId == prev(UserId) , prev(Name), ""),
+         PreviousTime = iff(UserId == prev(UserId) , prev(TimeGenerated), datetime(null))
+// | extend PreviousEvent = iff(UserId == prev(UserId) and SessionId == prev(SessionId), prev(Name), ""),
+//          PreviousTime = iff(UserId == prev(UserId) and SessionId == prev(SessionId), prev(TimeGenerated), datetime(null))
+| where Name in ("ScreenLockEvent","ApplicationExitEvent","AgentLogoutEvent","AgentLoginEvent") and PreviousEvent in ("ScreenUnlockEvent","AgentLoginEvent","ApplicationStartEvent")
+|where not(PreviousEvent=="ScreenUnlockEvent" and Name=="AgentLoginEvent")
+| project UserId,ClientModel, TeamId,SessionId, TimeGenerated, Name, PreviousTime, PreviousEvent
+| extend RemovedLockStateDuration =datetime_diff('second', TimeGenerated, PreviousTime)
+|extend day=startofday(TimeGenerated),PreviousDay=startofday(PreviousTime)
+|where day==PreviousDay
+| summarize RemovedLockStateDuration=sum(RemovedLockStateDuration) by UserId,ClientModel,TeamId,day 
+|join kind=fullouter NoLastExitEvent on UserId,ClientModel,TeamId,day
+|extend  NoLastExit=iff(isnull(NoAppExitDur),0,NoAppExitDur)
+|extend RemovedLockStateDuration=RemovedLockStateDuration+NoLastExit
+|project day,TeamId,UserId,ClientModel,RemovedLockStateDuration;
+ 
+let DisabledEvents=
+FilteredEvents
+| where Name contains "SanasDisabledEvent" or Name contains "SanasEnabledEvent"
+| project TimeGenerated, Name, UserId,TeamId = tostring(Properties.AgentTeamId), ClientModel,SessionId
+| order by UserId, ClientModel,TimeGenerated asc
+| serialize
+// | extend PreviousEvent = iff(UserId == prev(UserId) and Name=="SanasEnabledEvent"and prev(Name)=="SanasDisabledEvent", prev(Name), ""),
+//          PreviousTime = iff(UserId == prev(UserId) and Name=="SanasEnabledEvent"and prev(Name)=="SanasDisabledEvent", prev(TimeGenerated), datetime(null))
+| extend PreviousEvent = iff(UserId == prev(UserId) and SessionId == prev(SessionId), prev(Name), ""),
+         PreviousTime = iff(UserId == prev(UserId) and SessionId == prev(SessionId), prev(TimeGenerated), datetime(null))
+| where Name contains "SanasEnabledEvent" and PreviousEvent contains "SanasDisabledEvent"
+| project UserId,ClientModel, TeamId,SessionId, TimeGenerated, Name, PreviousTime, PreviousEvent
+| extend DisabledDuration =datetime_diff('second', TimeGenerated, PreviousTime)
+| extend day=startofday(TimeGenerated),PreviousDay=startofday(PreviousTime)
+| where day==PreviousDay
+| summarize DisabledDuration=sum(DisabledDuration) by UserId,ClientModel,TeamId,day
+| join kind=inner (users) on UserId,TeamId,ClientModel
+|project-away ClientModel1,UserId1,TeamId1;
+
+
+let EngagedEvents=
+FilteredEvents
+| where Name == 'AudioSessionStateChangedEvent' and Properties.State in ('Active', 'Inactive') and Properties.ProcessName !has "Rundll32"
+      and Properties.ProcessName !in ("Settings")
+      and Properties.IsSanasEnabled in ('True')
+|project TimeGenerated,State=tostring(Properties.State),UserId,TeamId = tostring(Properties.AgentTeamId), ClientModel,SessionId
+|order by UserId, ClientModel,TimeGenerated asc
+|serialize
+| extend PreviousEvent = iff(UserId == prev(UserId) and SessionId == prev(SessionId), prev(State), ""),
+         PreviousTime = iff(UserId == prev(UserId) and SessionId == prev(SessionId), prev(TimeGenerated), datetime(null))
+| where State contains "Inactive" and PreviousEvent contains "Active"
+| extend CallDuration =datetime_diff('second', TimeGenerated, PreviousTime)
+|where CallDuration >60
+|extend day=startofday(TimeGenerated)
+| summarize Engaged=sum(CallDuration) by UserId,ClientModel,day
+| join kind=inner (users) on UserId,ClientModel;
+ 
+lockEvents
+|join kind=fullouter DisabledEvents on UserId,ClientModel,day,TeamId
+|extend AppEnabledDuration=iff(isnotempty(DisabledDuration),RemovedLockStateDuration-DisabledDuration,RemovedLockStateDuration)
+| extend AppEnabledDuration = strcat((format_timespan(AppEnabledDuration * 1s, 'hh')), "h " , (format_timespan(AppEnabledDuration * 1s, 'mm')), "m")
+|project AppEnabledDuration,UserId,ClientModel,day, TeamId, UserAuthenticatedId
+|join kind= fullouter usersEvents on UserId,ClientModel,TeamId,day
+|extend SessionDuration=strcat((format_timespan(SessionDuration * 1s, 'hh')), "h " , (format_timespan(SessionDuration * 1s, 'mm')), "m")
+| extend AppEnabledDuration=iff(isnotempty(AppEnabledDuration),AppEnabledDuration,SessionDuration)
+|join kind= fullouter EngagedEvents on UserId,ClientModel,TeamId,day
+|extend Engaged=iff(isnotempty(Engaged),"Yes","No")
+| extend TeamId = iff(isnotempty(TeamId), TeamId, TeamId1)
+    | extend AgentId = iff(isnotempty(UserAuthenticatedId), UserAuthenticatedId, UserAuthenticatedId1)
+    | where isnotempty(UserId)
+    | extend UserIdParts = split(UserId1,'.')
+| project UserID=strcat_array(array_slice(UserIdParts, 2, -1),'.'),TeamId,AgentId,MachineName=tostring(ClientModel),FirstSeen,LastSeen,SessionDuration,AppEnabledDuration,Engaged
+| sort by FirstSeen desc
+|project UserID, TeamId ,MachineName, AgentId, FirstSeen,LastSeen,SessionDuration,AppEnabledDuration,Engaged
